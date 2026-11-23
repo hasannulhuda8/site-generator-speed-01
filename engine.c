@@ -2053,22 +2053,25 @@ static void join_lines(Buf *out, Str *lines, u32 n) {
 static void render_markdown(Str src, LinkCtx *lc, Map *slug_cache,
                             Buf *html, TocEntry **toc_out, u32 *ntoc_out,
                             Str *excerpt_out) {
-  // line index
-  u32 nlines = 1;
-  for (u32 i = 0; i < src.n; i++)
-    if (src.p[i] == '\n') nlines++;
-  Str *lines = (Str *)arena_alloc(sizeof(Str) * nlines, 8);
+  // line index, one pass with a doubling array
+  u32 lines_cap = 64, nlines = 0;
+  Str *lines = (Str *)arena_alloc(sizeof(Str) * lines_cap, 8);
   {
-    u32 start = 0, li = 0;
+    u32 start = 0;
     for (u32 i = 0; i <= src.n; i++) {
       if (i == src.n || src.p[i] == '\n') {
-        lines[li].p = src.p + start;
-        lines[li].n = i - start;
-        li++;
+        if (nlines == lines_cap) {
+          Str *nl = (Str *)arena_alloc(sizeof(Str) * lines_cap * 2, 8);
+          memcpy(nl, lines, sizeof(Str) * nlines);
+          lines = nl;
+          lines_cap *= 2;
+        }
+        lines[nlines].p = src.p + start;
+        lines[nlines].n = i - start;
+        nlines++;
         start = i + 1;
       }
     }
-    nlines = li;
   }
   u32 toc_cap = 16, ntoc = 0;
   TocEntry *toc = (TocEntry *)arena_alloc(sizeof(TocEntry) * toc_cap, 8);
@@ -2885,10 +2888,18 @@ static void render_nodes(Node **nodes, u32 n, Value **scopes, u32 nscopes,
         buf_str(out, nd->text);
         break;
       case N_VAR: {
-        Buf tmp;
-        buf_init(&tmp);
-        tpl_text_of(tpl_lookup(scopes, nscopes, nd->path, nd->npath), &tmp);
-        buf_escape_html(out, buf_str_view(&tmp));
+        // Fast path: a plain string value escapes straight from its
+        // storage; anything else renders to a scratch buffer first
+        // (the general path, unchanged).
+        Value *v = tpl_lookup(scopes, nscopes, nd->path, nd->npath);
+        if (v && v->kind == V_STR) {
+          buf_escape_html(out, v->s);
+        } else {
+          Buf tmp;
+          buf_init(&tmp);
+          tpl_text_of(v, &tmp);
+          buf_escape_html(out, buf_str_view(&tmp));
+        }
         break;
       }
       case N_RAW:
@@ -4103,6 +4114,24 @@ static void json_object(Json *j, JsonMemberFn fn, void *ctx) {
   }
 }
 
+// A string value as a Str: a view into the raw input when it has no
+// escapes (the common case: file contents and template sources are
+// then copied nowhere), else decoded into a fresh buffer.
+static Str json_string_view(Json *j) {
+  u32 start = j->pos + 1;  // after the opening quote
+  u32 hit = json_special_at(j->p, j->n, start);
+  if (hit < j->n && j->p[hit] == '"') {
+    j->pos = hit + 1;
+    Str s = {j->p + start, hit - start};
+    return s;
+  }
+  Buf b;
+  buf_init(&b);
+  j->pos = start - 1;
+  json_string(j, &b);
+  return buf_str_view(&b);
+}
+
 typedef struct {
   CaseIn in;
   Str *tpl_names, *tpl_srcs;
@@ -4114,15 +4143,9 @@ typedef struct {
 static void site_member(void *ctx, Str key, Json *j) {
   CaseIn *in = (CaseIn *)ctx;
   if (str_eq_c(key, "title")) {
-    Buf b;
-    buf_init(&b);
-    json_string(j, &b);
-    in->site_title = buf_str_view(&b);
+    in->site_title = json_string_view(j);
   } else if (str_eq_c(key, "base_url")) {
-    Buf b;
-    buf_init(&b);
-    json_string(j, &b);
-    in->site_base_raw = buf_str_view(&b);
+    in->site_base_raw = json_string_view(j);
   } else if (str_eq_c(key, "per_page")) {
     in->per_page = json_uint(j);
   } else if (str_eq_c(key, "recent")) {
@@ -4134,9 +4157,7 @@ static void site_member(void *ctx, Str key, Json *j) {
 
 static void template_member(void *ctx, Str key, Json *j) {
   CaseParse *cp = (CaseParse *)ctx;
-  Buf b;
-  buf_init(&b);
-  json_string(j, &b);
+  Str tv = json_string_view(j);
   if (cp->in.n_templates == cp->tpl_cap) {
     u32 ncap = cp->tpl_cap ? cp->tpl_cap * 2 : 32;
     Str *nn = (Str *)arena_alloc(sizeof(Str) * ncap, 8);
@@ -4150,7 +4171,7 @@ static void template_member(void *ctx, Str key, Json *j) {
     cp->tpl_cap = ncap;
   }
   cp->tpl_names[cp->in.n_templates] = key;
-  cp->tpl_srcs[cp->in.n_templates] = buf_str_view(&b);
+  cp->tpl_srcs[cp->in.n_templates] = tv;
   cp->in.n_templates++;
 }
 
@@ -4158,15 +4179,9 @@ static void file_member(void *ctx, Str key, Json *j) {
   CaseParse *cp = (CaseParse *)ctx;
   // ctx points at the CaseParse; the current file index is n_files
   if (str_eq_c(key, "path")) {
-    Buf b;
-    buf_init(&b);
-    json_string(j, &b);
-    cp->file_paths[cp->in.n_files] = buf_str_view(&b);
+    cp->file_paths[cp->in.n_files] = json_string_view(j);
   } else if (str_eq_c(key, "content")) {
-    Buf b;
-    buf_init(&b);
-    json_string(j, &b);
-    cp->file_contents[cp->in.n_files] = buf_str_view(&b);
+    cp->file_contents[cp->in.n_files] = json_string_view(j);
   } else {
     json_skip(j);
   }
