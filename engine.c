@@ -1774,10 +1774,36 @@ static void flush_plain(Buf *out, Str s, u32 from, u32 to) {
   }
 }
 
+// The offset of the first inline-markup byte in s[from..n), or n:
+// backslash, backtick, star or open bracket.
+static u32 inline_special_at(Str s, u32 from) {
+  u32 i = from;
+  while (i + 16 <= s.n) {
+    v128_t v = wasm_v128_load(s.p + i);
+    v128_t hit = wasm_i8x16_eq(v, wasm_i8x16_splat('\\'));
+    hit = wasm_v128_or(hit, wasm_i8x16_eq(v, wasm_i8x16_splat('`')));
+    hit = wasm_v128_or(hit, wasm_i8x16_eq(v, wasm_i8x16_splat('*')));
+    hit = wasm_v128_or(hit, wasm_i8x16_eq(v, wasm_i8x16_splat('[')));
+    u32 mask = wasm_i8x16_bitmask(hit);
+    if (mask) return i + (u32)__builtin_ctz(mask);
+    i += 16;
+  }
+  while (i < s.n) {
+    u8 c = s.p[i];
+    if (c == '\\' || c == '`' || c == '*' || c == '[') return i;
+    i++;
+  }
+  return s.n;
+}
+
 static void render_inline(Str s, LinkCtx *lc, Buf *out) {
   u32 plain = 0, i = 0, n = s.n;
   while (i < n) {
     u8 c = s.p[i];
+    if (c != '\\' && c != '`' && c != '*' && c != '[') {
+      i = inline_special_at(s, i);
+      continue;
+    }
     if (c == '\\') {
       if (i + 1 < n && is_escapable(s.p[i + 1])) {
         flush_plain(out, s, plain, i);
@@ -2772,18 +2798,29 @@ static int obj_has(Value *o, Str key) {
 
 // The value at path in the scope stack (scopes are V_OBJ values,
 // innermost last); 0 when absent.
+// The pair index of key in o, or -1 (one scan; obj_get/obj_has each
+// scanned again, and tpl_lookup used to pay that per segment).
+static i32 obj_find(Value *o, Str key) {
+  if (!o || o->kind != V_OBJ) return -1;
+  for (u32 i = 0; i < o->npairs; i++)
+    if (str_eq(o->pairs[i].key, key)) return (i32)i;
+  return -1;
+}
+
 static Value *tpl_lookup(Value **scopes, u32 nscopes, Str *path, u32 npath) {
   for (i32 s = (i32)nscopes - 1; s >= 0; s--) {
     Value *scope = scopes[s];
-    if (!obj_get(scope, path[0]) && !obj_has(scope, path[0])) continue;
-    Value *v = obj_get(scope, path[0]);
+    i32 i0 = obj_find(scope, path[0]);
+    if (i0 < 0) continue;
+    Value *v = scope->pairs[i0].val;
     int miss = 0;
     for (u32 k = 1; k < npath; k++) {
-      if (!v || v->kind != V_OBJ || !obj_has(v, path[k])) {
+      i32 ik = obj_find(v, path[k]);
+      if (ik < 0) {
         miss = 1;
         break;
       }
-      v = obj_get(v, path[k]);
+      v = v->pairs[ik].val;
     }
     return miss ? 0 : v;
   }
