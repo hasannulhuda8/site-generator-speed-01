@@ -1,5 +1,12 @@
 # site-generator-speed-01 — a WebAssembly engine entry
 
+Built for make.fun's "Build a static site faster" bounty:
+https://make.fun/bounty/site-generator-speed-01-run-20261122
+
+[![competition](https://make.fun/badge/site-generator-speed-01-run-20261122.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122)
+[![rank](https://make.fun/badge/site-generator-speed-01-run-20261122/hasannulhuda8/site-generator-speed-01/rank.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
+[![reward](https://make.fun/badge/site-generator-speed-01-run-20261122/hasannulhuda8/site-generator-speed-01/reward.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
+
 A from-scratch reimplementation of the makefun-site 1.0.0 build,
 written in C and compiled to WebAssembly, with a thin JavaScript
 shell. The goal is the smallest possible CPU time from cold process
