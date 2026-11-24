@@ -19,6 +19,9 @@
 
 extern void na_build_all(const unsigned char *raw, unsigned len,
                          const unsigned char **out, unsigned *out_len);
+extern unsigned char *na_input_begin(void);
+extern void na_build_all_at(unsigned len, const unsigned char **out,
+                            unsigned *out_len);
 
 static napi_value RunAll(napi_env env, napi_callback_info info) {
   size_t argc = 1;
@@ -108,16 +111,35 @@ static napi_value RunCli(napi_env env, napi_callback_info info) {
     napi_create_int32(env, -1, &rc);
     return rc;
   }
-  unsigned char *raw;
-  unsigned raw_len;
-  if (read_all(in_path, &raw, &raw_len) != 0) {
+  // Read the cases file straight into the engine's reservation:
+  // no intermediate buffer, no copy of the input.
+  int fd = open(in_path, O_RDONLY);
+  if (fd < 0) {
     napi_create_int32(env, -1, &rc);
     return rc;
   }
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    close(fd);
+    napi_create_int32(env, -1, &rc);
+    return rc;
+  }
+  unsigned raw_len = (unsigned)st.st_size;
+  unsigned char *slot = na_input_begin();
+  unsigned done = 0;
+  while (done < raw_len) {
+    ssize_t r = read(fd, slot + done, raw_len - done);
+    if (r <= 0) {
+      close(fd);
+      napi_create_int32(env, -1, &rc);
+      return rc;
+    }
+    done += (unsigned)r;
+  }
+  close(fd);
   const unsigned char *out;
   unsigned out_len;
-  na_build_all(raw, raw_len, &out, &out_len);
-  free(raw);
+  na_build_all_at(raw_len, &out, &out_len);
   if (write_all(out_path, out, out_len) != 0) {
     napi_create_int32(env, -1, &rc);
     return rc;

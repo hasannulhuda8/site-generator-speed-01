@@ -1,10 +1,11 @@
-// The harness driver. Fast path first: when the native engine
-// (engine.node) is loaded, it reads cases.json, builds the whole
-// site set, writes answers.json and ends the process itself with
-// SYS_exit_group, so Node's teardown never runs. It returns only
-// when that path could not run; then the ordinary flow below does
-// the same job through runAllBytes (native bytes path, or the
-// WebAssembly fallback behind solve.js). Outside a container
+// The harness driver. Fastest path first: load the native engine
+// (engine.node) directly and let it read cases.json, build the
+// whole site set, write answers.json and end the process itself
+// with SYS_exit_group, so neither solve.js's module graph nor
+// Node's teardown costs anything on the clock. The addon returns
+// only when that path could not run; then solve.js is imported and
+// the same job goes through runAllBytes (the native bytes path, or
+// the WebAssembly fallback behind solve.js). Outside a container
 // MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input
 // and /output.
 //
@@ -14,6 +15,21 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createRequire } from 'node:module';
+
+try {
+  const require = createRequire(import.meta.url);
+  const addon = require('./engine.node') as {
+    runCli?: () => number;
+  };
+  if (addon && typeof addon.runCli === 'function') {
+    // Returns only on failure; on success the process has already
+    // exited from inside the addon with answers.json written.
+    addon.runCli();
+  }
+} catch {
+  // No usable native addon: fall through to solve.js.
+}
 
 /** solve.js, imported by its URL (a .js module carries no types). */
 const solve = (await import(new URL('./solve.js', import.meta.url).href)) as {

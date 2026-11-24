@@ -29,8 +29,9 @@ byte-identical answers.json.
   builds, writes answers.json and ends the process with the raw
   `SYS_exit_group` syscall, skipping Node's teardown entirely.
 - `engine.node` — the native addon: gcc `-O3`, profile-guided
-  (trained on the practice set and fuzz cases), SSE2 scans, and a
-  version script so it exports only `napi_register_module_v1`.
+  (trained on the practice set and fuzz cases), SIMD scans (AVX2
+  where the CPU offers it, SSE2 otherwise, chosen at runtime), and
+  a version script so it exports only `napi_register_module_v1`.
   Rebuild with `./build_pgo.sh`.
 - `engine.wasm` — the same source compiled with zig cc
   (`-target wasm32-freestanding -Os -msimd128`, stripped), used
@@ -39,9 +40,10 @@ byte-identical answers.json.
 - `solve.js` — the public face: prefers the native engine,
   falls back to `solve_wasm.js` + `engine.wasm`. Both paths
   produce byte-identical output.
-- `main.ts` — the harness driver: hands the whole job to the
-  native CLI path when available, otherwise reads cases.json as
-  raw bytes and writes the answers.json bytes the engine returns.
+- `main.ts` — the harness driver: loads the native addon
+  directly and hands it the whole job when available, otherwise
+  reads cases.json as raw bytes and writes the answers.json bytes
+  the engine returns.
   It never parses, re-encodes or serialises anything in
   JavaScript, and it sets no V8 flags (the baseline's
   `--no-incremental-marking` measurably hurts this entry's
@@ -59,9 +61,15 @@ byte-identical answers.json.
 - Byte domain throughout: rendering writes into growable byte
   buffers; nothing round-trips through JS strings. File contents
   and template sources are used as zero-copy views into the input.
-- SIMD scans (SSE2 natively, SIMD128 in wasm) for the hot
+- SIMD scans (AVX2/SSE2 natively, SIMD128 in wasm) for the hot
   delimiter searches: HTML escaping, JSON string scanning on
   input, JSON escaping on output, and inline-markup skipping.
+- Templates are compiled once per case to a flat bytecode
+  program; the executor walks it sequentially with an explicit
+  program counter and a loop-state stack instead of recursing
+  through pointer-linked node lists.
+- The CLI path reads cases.json straight into the engine's
+  memory reservation: the input is never copied.
 - Table-driven slug decomposition instead of ICU normalisation,
   open-addressing hash maps for collections, tags, slug caches and
   dedupe sets, cached card values, and a per-case arena reset so a

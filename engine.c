@@ -402,9 +402,60 @@ typedef __m128i v128_t;
 #include <wasm_simd128.h>
 #endif
 
+#ifdef NATIVE_BUILD
+static int has_avx2(void) {
+  static int v = -1;
+  if (v < 0) v = __builtin_cpu_supports("avx2") ? 1 : 0;
+  return v;
+}
+
+// 32-byte scan for the first byte in a mode's special set, from
+// `from`; returns the hit offset, or the offset where the wide loop
+// stopped (the caller resumes with the 16-byte scan there, which
+// re-finds a hit at its first byte when this returned one).
+// Modes: 0 html (& < > " '), 1 json out (", \, control < 0x20),
+// 2 inline (\, `, *, [), 3 json in (", \).
+__attribute__((target("avx2"))) static u32
+scan32(const u8 *p, u32 n, u32 from, int mode) {
+  u32 i = from;
+  __m256i bias = _mm256_set1_epi8((char)0x80);
+  __m256i limit = _mm256_set1_epi8((char)(0x20 ^ 0x80));
+  while (i + 32 <= n) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)(p + i));
+    __m256i hit;
+    if (mode == 0) {
+      hit = _mm256_cmpeq_epi8(v, _mm256_set1_epi8('&'));
+      hit = _mm256_or_si256(hit, _mm256_cmpeq_epi8(v, _mm256_set1_epi8('<')));
+      hit = _mm256_or_si256(hit, _mm256_cmpeq_epi8(v, _mm256_set1_epi8('>')));
+      hit = _mm256_or_si256(hit, _mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')));
+      hit = _mm256_or_si256(hit, _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\'')));
+    } else if (mode == 2) {
+      hit = _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\'));
+      hit = _mm256_or_si256(hit, _mm256_cmpeq_epi8(v, _mm256_set1_epi8('`')));
+      hit = _mm256_or_si256(hit, _mm256_cmpeq_epi8(v, _mm256_set1_epi8('*')));
+      hit = _mm256_or_si256(hit, _mm256_cmpeq_epi8(v, _mm256_set1_epi8('[')));
+    } else {
+      hit = _mm256_cmpeq_epi8(v, _mm256_set1_epi8('"'));
+      hit = _mm256_or_si256(hit, _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\')));
+      if (mode == 1) {
+        __m256i ctrl = _mm256_cmpgt_epi8(limit, _mm256_xor_si256(v, bias));
+        hit = _mm256_or_si256(hit, ctrl);
+      }
+    }
+    u32 mask = (u32)_mm256_movemask_epi8(hit);
+    if (mask) return i + (u32)__builtin_ctz(mask);
+    i += 32;
+  }
+  return i;
+}
+#endif
+
 // The offset of the first HTML-special byte in s[from..n), or n.
 static u32 html_special_at(Str s, u32 from) {
   u32 i = from;
+#ifdef NATIVE_BUILD
+  if (has_avx2()) i = scan32(s.p, s.n, from, 0);
+#endif
   while (i + 16 <= s.n) {
     v128_t v = wasm_v128_load(s.p + i);
     v128_t hit = wasm_i8x16_eq(v, wasm_i8x16_splat('&'));
@@ -450,6 +501,9 @@ static void buf_escape_html(Buf *b, Str s) {
 // the xor-0x80 trick, so UTF-8 high bytes never match).
 static u32 json_out_special_at(Str s, u32 from) {
   u32 i = from;
+#ifdef NATIVE_BUILD
+  if (has_avx2()) i = scan32(s.p, s.n, from, 1);
+#endif
   v128_t bias = wasm_i8x16_splat((char)0x80);
   v128_t limit = wasm_i8x16_splat((char)(0x20 ^ 0x80));
   while (i + 16 <= s.n) {
@@ -1833,6 +1887,9 @@ static void flush_plain(Buf *out, Str s, u32 from, u32 to) {
 // backslash, backtick, star or open bracket.
 static u32 inline_special_at(Str s, u32 from) {
   u32 i = from;
+#ifdef NATIVE_BUILD
+  if (has_avx2()) i = scan32(s.p, s.n, from, 2);
+#endif
   while (i + 16 <= s.n) {
     v128_t v = wasm_v128_load(s.p + i);
     v128_t hit = wasm_i8x16_eq(v, wasm_i8x16_splat('\\'));
@@ -2928,10 +2985,29 @@ static int tpl_truthy(Value *v) {
 
 #define INCLUDE_DEPTH 8
 
+// A compiled template program: the node tree flattened to ops, so
+// the executor walks memory sequentially with an explicit program
+// counter and a loop-state stack instead of recursing through
+// pointer-linked node lists. Compilation only re-encodes control;
+// the semantics are render_nodes' exactly.
+enum { OP_TEXT, OP_VAR, OP_RAW, OP_IF, OP_JMP, OP_FOR, OP_NEXT, OP_INCLUDE };
+
+typedef struct {
+  u32 kind;
+  Str text;      // OP_TEXT
+  Str *path;     // OP_VAR / OP_RAW / OP_IF / OP_FOR
+  u32 npath;
+  int not_flag;  // OP_IF
+  Str name;      // OP_FOR variable / OP_INCLUDE template
+  u32 arg;       // jump target op index
+} Op;
+
 typedef struct {
   Map *by_name;    // template name -> index into the templates array
   Node ***roots;   // per index: node list (array of Node*)
   u32 *counts;     // per index: node count
+  Op **progs;      // per index: compiled program
+  u32 *prog_counts;  // per index: op count
 } TplSet;
 
 static void render_nodes(Node **nodes, u32 n, Value **scopes, u32 nscopes,
@@ -3001,6 +3077,201 @@ static void render_nodes(Node **nodes, u32 n, Value **scopes, u32 nscopes,
         }
         break;
       }
+    }
+  }
+}
+
+// ------------------------------------------------------------ bytecode
+
+typedef struct {
+  Op *ops;
+  u32 n, cap;
+} OpVec;
+
+static void op_push(OpVec *v, Op op) {
+  if (v->n == v->cap) {
+    u32 ncap = v->cap ? v->cap * 2 : 32;
+    Op *no = (Op *)arena_alloc(sizeof(Op) * ncap, 8);
+    if (v->ops) memcpy(no, v->ops, sizeof(Op) * v->n);
+    v->ops = no;
+    v->cap = ncap;
+  }
+  v->ops[v->n++] = op;
+}
+
+static void compile_nodes(OpVec *v, Node **nodes, u32 n) {
+  for (u32 i = 0; i < n; i++) {
+    Node *nd = nodes[i];
+    Op op;
+    memset(&op, 0, sizeof op);
+    switch (nd->kind) {
+      case N_TEXT:
+        op.kind = OP_TEXT;
+        op.text = nd->text;
+        op_push(v, op);
+        break;
+      case N_VAR:
+        op.kind = OP_VAR;
+        op.path = nd->path;
+        op.npath = nd->npath;
+        op_push(v, op);
+        break;
+      case N_RAW:
+        op.kind = OP_RAW;
+        op.path = nd->path;
+        op.npath = nd->npath;
+        op_push(v, op);
+        break;
+      case N_INCLUDE:
+        op.kind = OP_INCLUDE;
+        op.name = nd->name;
+        op_push(v, op);
+        break;
+      case N_IF: {
+        op.kind = OP_IF;
+        op.path = nd->path;
+        op.npath = nd->npath;
+        op.not_flag = nd->not_flag;
+        u32 ifidx = v->n;
+        op_push(v, op);
+        compile_nodes(v, nd->thenb, nd->nthen);
+        if (nd->has_else) {
+          Op jmp;
+          memset(&jmp, 0, sizeof jmp);
+          jmp.kind = OP_JMP;
+          u32 jmpidx = v->n;
+          op_push(v, jmp);
+          v->ops[ifidx].arg = v->n;
+          compile_nodes(v, nd->elseb, nd->nelse);
+          v->ops[jmpidx].arg = v->n;
+        } else {
+          v->ops[ifidx].arg = v->n;
+        }
+        break;
+      }
+      case N_FOR: {
+        op.kind = OP_FOR;
+        op.path = nd->path;
+        op.npath = nd->npath;
+        op.name = nd->name;
+        u32 foridx = v->n;
+        op_push(v, op);
+        compile_nodes(v, nd->body, nd->nbody);
+        Op next;
+        memset(&next, 0, sizeof next);
+        next.kind = OP_NEXT;
+        next.arg = foridx;
+        op_push(v, next);
+        v->ops[foridx].arg = v->n;
+        break;
+      }
+    }
+  }
+}
+
+typedef struct {
+  Value *xs;
+  u32 k;
+  Str name;
+} LoopState;
+
+// The per-iteration scope frame, exactly as render_nodes' N_FOR
+// builds it.
+static void for_frame(Str name, Value *xs, u32 k, Value **scopes,
+                      u32 slot) {
+  Pair *loop_pairs = (Pair *)arena_alloc(sizeof(Pair) * 4, 8);
+  loop_pairs[0] = (Pair){str_of("index"), val_int((i32)k + 1)};
+  loop_pairs[1] = (Pair){str_of("first"), val_bool(k == 0)};
+  loop_pairs[2] = (Pair){str_of("last"), val_bool(k == xs->nitems - 1)};
+  loop_pairs[3] = (Pair){str_of("length"), val_int((i32)xs->nitems)};
+  Pair *frame_pairs = (Pair *)arena_alloc(sizeof(Pair) * 2, 8);
+  frame_pairs[0] = (Pair){name, xs->items[k]};
+  frame_pairs[1] = (Pair){str_of("loop"), val_obj(loop_pairs, 4)};
+  scopes[slot] = val_obj(frame_pairs, 2);
+}
+
+#define MAX_LOOP_NEST 128
+
+static void exec_ops(Op *ops, u32 n, Value **scopes, u32 nscopes,
+                     TplSet *tpls, int depth, Buf *out) {
+  LoopState loops[MAX_LOOP_NEST];
+  u32 nloops = 0;
+  u32 pc = 0;
+  while (pc < n) {
+    Op *op = &ops[pc];
+    switch (op->kind) {
+      case OP_TEXT:
+        buf_str(out, op->text);
+        pc++;
+        break;
+      case OP_VAR: {
+        Value *v = tpl_lookup(scopes, nscopes + nloops, op->path, op->npath);
+        if (v && v->kind == V_STR) {
+          buf_escape_html(out, v->s);
+        } else {
+          Buf tmp;
+          buf_init(&tmp);
+          tpl_text_of(v, &tmp);
+          buf_escape_html(out, buf_str_view(&tmp));
+        }
+        pc++;
+        break;
+      }
+      case OP_RAW:
+        tpl_text_of(tpl_lookup(scopes, nscopes + nloops, op->path, op->npath),
+                    out);
+        pc++;
+        break;
+      case OP_IF: {
+        int v = tpl_truthy(
+            tpl_lookup(scopes, nscopes + nloops, op->path, op->npath));
+        pc = (v != op->not_flag) ? pc + 1 : op->arg;
+        break;
+      }
+      case OP_JMP:
+        pc = op->arg;
+        break;
+      case OP_FOR: {
+        Value *xs =
+            tpl_lookup(scopes, nscopes + nloops, op->path, op->npath);
+        if (!xs || xs->kind != V_ARR || xs->nitems == 0 ||
+            nloops >= MAX_LOOP_NEST) {
+          pc = op->arg;
+          break;
+        }
+        loops[nloops].xs = xs;
+        loops[nloops].k = 0;
+        loops[nloops].name = op->name;
+        for_frame(op->name, xs, 0, scopes, nscopes + nloops);
+        nloops++;
+        pc++;
+        break;
+      }
+      case OP_NEXT: {
+        LoopState *st = &loops[nloops - 1];
+        st->k++;
+        if (st->k < st->xs->nitems) {
+          for_frame(st->name, st->xs, st->k, scopes, nscopes + nloops - 1);
+          pc = op->arg + 1;
+        } else {
+          nloops--;
+          pc++;
+        }
+        break;
+      }
+      case OP_INCLUDE: {
+        if (depth < INCLUDE_DEPTH) {
+          i32 ti = map_get(tpls->by_name, op->name);
+          if (ti >= 0)
+            exec_ops(tpls->progs[ti], tpls->prog_counts[ti], scopes,
+                     nscopes + nloops, tpls, depth + 1, out);
+        }
+        pc++;
+        break;
+      }
+      default:
+        pc++;
+        break;
     }
   }
 }
@@ -3344,6 +3615,25 @@ static void build_core(CaseIn *in, u32 mode, Buf *result) {
       strvec_push(&report, buf_str_view(&err));
       tpl_lists[i] = 0;
       tpl_counts[i] = 0;
+    }
+  }
+  // Compile every parsed template to its flat program.
+  Op **tpl_progs = (Op **)arena_alloc(sizeof(Op *) * (n_templates ? n_templates : 1), 8);
+  u32 *tpl_prog_counts = (u32 *)arena_alloc(sizeof(u32) * (n_templates ? n_templates : 1), 4);
+  tpls.progs = tpl_progs;
+  tpls.prog_counts = tpl_prog_counts;
+  for (u32 i = 0; i < n_templates; i++) {
+    if (tpl_lists[i]) {
+      OpVec v;
+      v.ops = 0;
+      v.n = 0;
+      v.cap = 0;
+      compile_nodes(&v, tpl_lists[i], tpl_counts[i]);
+      tpl_progs[i] = v.ops;
+      tpl_prog_counts[i] = v.n;
+    } else {
+      tpl_progs[i] = 0;
+      tpl_prog_counts[i] = 0;
     }
   }
 
@@ -3702,8 +3992,8 @@ static void build_core(CaseIn *in, u32 mode, Buf *result) {
     scope_buf[0] = val_obj(rp, 4);
     Buf out;
     buf_init(&out);
-    render_nodes(tpl_lists[ti], tpl_counts[ti], scope_buf, 1, &tpls,
-                 0, &out);
+    exec_ops(tpls.progs[ti], tpls.prog_counts[ti], scope_buf, 1, &tpls,
+             0, &out);
     Buf path;
     buf_init(&path);
     buf_str(&path, s->out_dir);
@@ -3768,8 +4058,8 @@ static void build_core(CaseIn *in, u32 mode, Buf *result) {
         scope_buf[0] = val_obj(rp, 5);
         Buf out;
         buf_init(&out);
-        render_nodes(tpl_lists[ti], tpl_counts[ti], scope_buf, 1,
-                     &tpls, 0, &out);
+        exec_ops(tpls.progs[ti], tpls.prog_counts[ti], scope_buf, 1,
+                 &tpls, 0, &out);
         Buf path;
         buf_init(&path);
         if (k == 1) {
@@ -3806,8 +4096,8 @@ static void build_core(CaseIn *in, u32 mode, Buf *result) {
         scope_buf[0] = val_obj(rp, 4);
         Buf out;
         buf_init(&out);
-        render_nodes(tpl_lists[ti], tpl_counts[ti], scope_buf, 1,
-                     &tpls, 0, &out);
+        exec_ops(tpls.progs[ti], tpls.prog_counts[ti], scope_buf, 1,
+                 &tpls, 0, &out);
         Buf path;
         buf_init(&path);
         buf_c(&path, "tags/");
@@ -3829,8 +4119,8 @@ static void build_core(CaseIn *in, u32 mode, Buf *result) {
       scope_buf[0] = val_obj(rp, 3);
       Buf out;
       buf_init(&out);
-      render_nodes(tpl_lists[ti], tpl_counts[ti], scope_buf, 1,
-                   &tpls, 0, &out);
+      exec_ops(tpls.progs[ti], tpls.prog_counts[ti], scope_buf, 1,
+               &tpls, 0, &out);
       outputs_add(&outputs, str_of("tags/index.html"), buf_str_view(&out));
     }
   }
@@ -3998,6 +4288,9 @@ static u32 json_hex4(Json *j) {
 // The offset of the first '"' or '\\' in p[from..n), or n.
 static u32 json_special_at(const u8 *p, u32 n, u32 from) {
   u32 i = from;
+#ifdef NATIVE_BUILD
+  if (has_avx2()) i = scan32(p, n, from, 3);
+#endif
   while (i + 16 <= n) {
     v128_t v = wasm_v128_load(p + i);
     v128_t hit = wasm_i8x16_eq(v, wasm_i8x16_splat('"'));
@@ -4413,6 +4706,20 @@ void build_all_entry(
 void na_build_all(const u8 *raw, u32 len, const u8 **out, u32 *out_len) {
   mem_reserve();
   memcpy(mem_base, raw, len);
+  build_all_entry((uptr)mem_base, len);
+  *out = (const u8 *)g_result_ptr;
+  *out_len = g_result_len;
+}
+
+// Zero-copy variant for the CLI path: the caller reads the cases
+// file straight into the reservation (na_input_begin) and builds in
+// place, so the input is never copied.
+u8 *na_input_begin(void) {
+  mem_reserve();
+  return mem_base;
+}
+
+void na_build_all_at(u32 len, const u8 **out, u32 *out_len) {
   build_all_entry((uptr)mem_base, len);
   *out = (const u8 *)g_result_ptr;
   *out_len = g_result_len;
