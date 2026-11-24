@@ -11,8 +11,22 @@ typedef unsigned int u32;
 typedef int i32;
 typedef unsigned long long u64;
 
+#ifdef NATIVE_BUILD
+// Native (N-API) build of the same engine: glibc provides the memory
+// functions, the arena lives in an mmap reservation, and the SIMD
+// scans compile to SSE2. Without NATIVE_BUILD this file is the
+// freestanding WebAssembly module, unchanged.
+#include <string.h>
+#include <stdint.h>
+#include <sys/mman.h>
+typedef uintptr_t uptr;
+#else
+typedef u32 uptr;
+#endif
+
 // ------------------------------------------------------------ libc bits
 
+#ifndef NATIVE_BUILD
 void *memcpy(void *d, const void *s, unsigned long n) {
   // Chunked by hand: a __builtin_memcpy here would call itself.
   u8 *dd = (u8 *)d;
@@ -64,13 +78,31 @@ int memcmp(const void *a, const void *b, unsigned long n) {
   return 0;
 }
 
+#endif  // NATIVE_BUILD
+
 // ------------------------------------------------------------ arena
 
 static u8 *arena_base;   // start of the bump region (after the input pack)
 static u8 *arena_ptr;    // bump cursor
 static u8 *arena_end;    // current memory end
 
-static u32 mem_size(void) { return __builtin_wasm_memory_size(0) << 16; }
+#ifdef NATIVE_BUILD
+// The "linear memory" is one large anonymous reservation, paged in
+// lazily by the kernel on first touch; the bump arena never needs
+// more than a small fraction of it.
+#define MEM_CAP ((uptr)4 << 30)
+static u8 *mem_base;
+static void mem_reserve(void) {
+  if (mem_base) return;
+  void *m = mmap(0, MEM_CAP, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == (void *)-1) __builtin_trap();
+  mem_base = (u8 *)m;
+}
+static uptr mem_size(void) { return (uptr)(mem_base + MEM_CAP); }
+#else
+static uptr mem_size(void) { return __builtin_wasm_memory_size(0) << 16; }
+#endif
 
 static void arena_init(u8 *base) {
   arena_base = base;
@@ -79,14 +111,20 @@ static void arena_init(u8 *base) {
 }
 
 static void *arena_alloc(u32 n, u32 align) {
-  u32 p = (u32)arena_ptr;
-  u32 a = (p + (align - 1)) & ~(align - 1);
-  u32 need = a + n;
+  uptr p = (uptr)arena_ptr;
+  uptr a = (p + (align - 1)) & ~(uptr)(align - 1);
+  uptr need = a + n;
   if ((u8 *)need > arena_end) {
-    u32 want = need - (u32)arena_end;
-    u32 pages = (want + 65535) >> 16;
+    uptr want = need - (uptr)arena_end;
+    u32 pages = (u32)((want + 65535) >> 16);
+#ifdef NATIVE_BUILD
+    (void)pages;  // the reservation is committed end-to-end already
+    if (need > (uptr)(mem_base + MEM_CAP)) __builtin_trap();
+    arena_end = (u8 *)mem_size();
+#else
     if (__builtin_wasm_memory_grow(0, pages) == (u32)-1) __builtin_trap();
     arena_end = (u8 *)mem_size();
+#endif
   }
   arena_ptr = (u8 *)need;
   return (void *)a;
@@ -97,6 +135,11 @@ static void *arena_alloc_zero(u32 n, u32 align) {
   memset(p, 0, n);
   return p;
 }
+
+#ifdef NATIVE_BUILD
+uptr g_result_ptr;
+u32 g_result_len;
+#endif
 
 // ------------------------------------------------------------ strings
 
@@ -345,7 +388,19 @@ static int is_space_cp(u32 cp) {
 
 // ------------------------------------------------------------ escaping
 
+#ifdef NATIVE_BUILD
+#include <immintrin.h>
+typedef __m128i v128_t;
+#define wasm_v128_load(p) _mm_loadu_si128((const __m128i *)(p))
+#define wasm_i8x16_splat(c) _mm_set1_epi8((char)(c))
+#define wasm_i8x16_eq(a, b) _mm_cmpeq_epi8((a), (b))
+#define wasm_v128_or(a, b) _mm_or_si128((a), (b))
+#define wasm_v128_xor(a, b) _mm_xor_si128((a), (b))
+#define wasm_i8x16_lt(a, b) _mm_cmpgt_epi8((b), (a))
+#define wasm_i8x16_bitmask(v) ((u32)_mm_movemask_epi8(v))
+#else
 #include <wasm_simd128.h>
+#endif
 
 // The offset of the first HTML-special byte in s[from..n), or n.
 static u32 html_special_at(Str s, u32 from) {
@@ -3865,10 +3920,13 @@ static void build_core(CaseIn *in, u32 mode, Buf *result) {
 
 // Pack path (solve.js run/runCaseJson): parse the pack, build, and
 // leave the result pointer/length in the header at memory[0..8).
-__attribute__((export_name("build_entry"))) void build_entry(u32 pack_ptr,
+#ifndef NATIVE_BUILD
+__attribute__((export_name("build_entry")))
+#endif
+void build_entry(uptr pack_ptr,
                                                              u32 pack_len,
                                                              u32 mode) {
-  arena_init((u8 *)((pack_ptr + pack_len + 15) & ~15u));
+  arena_init((u8 *)((pack_ptr + pack_len + 15) & ~(uptr)15));
   Pack pk = {(const u8 *)pack_ptr, pack_len, 0};
   CaseIn in;
   in.n_templates = pack_u32(&pk);
@@ -3892,9 +3950,14 @@ __attribute__((export_name("build_entry"))) void build_entry(u32 pack_ptr,
   Buf result;
   buf_init(&result);
   build_core(&in, mode, &result);
+#ifdef NATIVE_BUILD
+  g_result_ptr = (uptr)result.p;
+  g_result_len = result.n;
+#else
   volatile u32 *hdr = (volatile u32 *)0;
   hdr[0] = (u32)result.p;
   hdr[1] = result.n;
+#endif
 }
 
 // ------------------------------------------------------------ JSON input
@@ -4266,9 +4329,12 @@ static void sort_pairs(Str *keys, Str *vals, u32 n) {
 // The arena for a case starts after the answers assembled so far, and
 // is reset for every case; each case's fragment is copied out before
 // the next case starts.
-__attribute__((export_name("build_all_entry"))) void build_all_entry(
-    u32 raw_ptr, u32 raw_len) {
-  u8 *answers_base = (u8 *)(((u32)raw_ptr + raw_len + 15) & ~15u);
+#ifndef NATIVE_BUILD
+__attribute__((export_name("build_all_entry")))
+#endif
+void build_all_entry(
+    uptr raw_ptr, u32 raw_len) {
+  u8 *answers_base = (u8 *)((raw_ptr + raw_len + 15) & ~(uptr)15);
   arena_init(answers_base);
   Buf answers;
   buf_init(&answers);
@@ -4304,7 +4370,7 @@ __attribute__((export_name("build_all_entry"))) void build_all_entry(
         build_core(&cp.in, 1, &frag);
         // copy the fragment into the answers region
         u8 *save_base = arena_base;
-        u32 save_ptr = (u32)arena_ptr;
+        uptr save_ptr = (uptr)arena_ptr;
         arena_base = answers_base;
         arena_ptr = answers_region_end;
         // answers Buf header lives on the stack; its storage may have
@@ -4330,7 +4396,25 @@ __attribute__((export_name("build_all_entry"))) void build_all_entry(
   arena_base = answers_base;
   arena_ptr = answers_region_end;
   buf_ch(&answers, ']');
+#ifdef NATIVE_BUILD
+  g_result_ptr = (uptr)answers.p;
+  g_result_len = answers.n;
+#else
   volatile u32 *hdr = (volatile u32 *)0;
   hdr[0] = (u32)answers.p;
   hdr[1] = answers.n;
+#endif
 }
+
+#ifdef NATIVE_BUILD
+// Native raw entry: copy the cases into the reservation and run the
+// raw path; the answers bytes stay in the arena (static storage,
+// valid until the next call).
+void na_build_all(const u8 *raw, u32 len, const u8 **out, u32 *out_len) {
+  mem_reserve();
+  memcpy(mem_base, raw, len);
+  build_all_entry((uptr)mem_base, len);
+  *out = (const u8 *)g_result_ptr;
+  *out_len = g_result_len;
+}
+#endif
